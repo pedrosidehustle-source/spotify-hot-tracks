@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 spotify_hot_tracks.py
-Version 1.2 - 2026-10-09
+Version 1.3 - 2026-10-09
 
 Croise tes titres likes et tes tops d'ecoute Spotify (4 semaines / 6 mois / long terme),
 calcule un score par titre, exporte un CSV et cree les playlists dans ton compte.
@@ -14,9 +14,14 @@ proposee par titre et les 4 playlists de set sont remplies automatiquement.
 
 v1.2 : migration vers les endpoints Web API de fevrier 2026 (les anciens renvoient 403) :
 POST /users/{id}/playlists -> POST /me/playlists ; PUT/POST /playlists/{id}/tracks -> /playlists/{id}/items.
+
+v1.3 : playlist "SOIREE (style x bpm)" : chaque titre est classe dans une famille de style (genres
+Exportify), les familles sont enchainees dans l'ordre de la soiree, et dans chaque famille les titres
+sont tries par BPM corrige (tempo ramene dans la plage naturelle du style, pour annuler les detections
+en double ou demi tempo). Lecture de TOUS les exports Exportify presents dans le dossier.
 """
 
-VERSION = "1.2"
+VERSION = "1.3"
 DATE_VERSION = "2026-10-09"
 
 import sys
@@ -37,7 +42,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # PARAMETRES (modifiables)
 # ---------------------------------------------------------------------------
-TOP_N_PLAYLIST = 100                     # nb de titres dans la playlist maitre
+TOP_N_PLAYLIST = 300                     # nb de titres dans la playlist maitre (300 = tout l'univers score)
 POIDS = {                                # poids de chaque horizon d'ecoute
     "long_term": 3.0,                    # ~ historique long
     "medium_term": 2.0,                  # ~ 6 derniers mois
@@ -58,7 +63,32 @@ NOMS_SETS = {
 SEUIL_ENERGIE_APERO = 0.50               # energie < seuil          -> apero
 SEUIL_ENERGIE_MONTEE = 0.65              # seuil apero <= energie < seuil -> montee
 SEUIL_DANSE_PEAK = 0.70                  # energie >= montee et dansabilite >= seuil -> peak, sinon -> fin de nuit
-FICHIER_EXPORTIFY = "Liked_Songs.csv"    # export Exportify (optionnel)
+# Exports Exportify : tous les .csv du dossier ayant les colonnes "Track URI" et "Energy" sont lus
+# (ex. Liked_Songs.csv + export de la playlist HOT TRACKS pour couvrir les titres non likes)
+
+# --- v1.3 : playlist SOIREE (style x BPM corrige) ---------------------------
+CREER_SOIREE = True
+NOM_PLAYLIST_SOIREE = "40 ans - SOIREE (style x bpm)"
+DUREE_SOIREE_H = 6.0                     # duree cible : on prend les meilleurs scores jusqu'a cette duree
+# Familles de style, DANS L'ORDRE DE LA SOIREE.
+# cle : (libelle, mots-cles de genre, plage BPM [min, 2 x min), sens du tri BPM)
+# Un titre est affecte a la famille qui a le plus de genres correspondants (egalite : voir PRIORITE_EGALITE).
+FAMILLES = [
+    ("chill",     "Chill / jazz / soul lente", ["trip-hop", "downtempo", "nu jazz", "acid jazz", "jazz", "lo-fi", "beats", "bossa", "chill", "ambient", "soul jazz", "neo soul", "indie soul"], 70, "asc"),
+    ("roots",     "Roots / lovers / rocksteady", ["reggae roots", "lover's rock", "rocksteady", "ska", "reggae", "roots"], 60, "asc"),
+    ("groove",    "Funk / soul / disco", ["funk", "disco", "soul", "motown", "r&b", "boogie", "northern soul", "électro swing"], 90, "asc"),
+    ("pop",       "Pop / chanson / rock", ["pop", "variété", "chanson", "indie", "rock", "folk", "new wave", "punk", "surf", "rockabilly", "yacht"], 80, "asc"),
+    ("afro",      "Afro / tropical", ["afro", "highlife", "soca", "zouk", "kompa", "cumbia", "moombahton", "latino", "reggaeton", "baile", "coupé-décalé", "amapiano", "maloya", "séga"], 85, "asc"),
+    ("hiphop",    "Hip-hop / rap", ["rap", "hip-hop", "hip hop", "trap", "drill", "boom bap", "grime"], 70, "asc"),
+    ("dancehall", "Dancehall / ragga / shatta", ["dancehall", "ragga", "shatta", "riddim", "bashment"], 75, "asc"),
+    ("house",     "House / électro", ["house", "techno", "électro", "electro", "garage uk", "tech", "minimal", "indie dance", "future bass", "nu disco", "breaks"], 95, "asc"),
+    ("dnb",       "Jungle / drum & bass", ["jungle", "drum & bass", "drum and bass", "breakbeat"], 160, "asc"),
+    ("dub",       "Dub (fin de nuit)", ["dub"], 60, "desc"),
+]
+# En cas d'egalite de genres correspondants : la famille la plus "dansante" gagne
+PRIORITE_EGALITE = ["dnb", "dancehall", "house", "hiphop", "afro", "dub", "roots", "groove", "chill", "pop"]
+# Titres sans genre : rattaches a une famille via energie / dansabilite
+FAMILLE_SANS_GENRE = {"apero": "chill", "montee": "groove", "peak": "house", "fin": "pop"}
 
 # ---------------------------------------------------------------------------
 # CONSTANTES TECHNIQUES
@@ -165,34 +195,52 @@ def infos_track(t):
         "duree": duree,
         "popularite": t.get("popularity", ""),
         "uri": t.get("uri", ""),
+        "duree_ms": duree_ms,
     }
 
 
 def lire_exportify():
-    """Lit l'export Exportify s'il existe. Retourne dict uri -> features (ou {})."""
-    chemin = os.path.join(BASE_DIR, FICHIER_EXPORTIFY)
-    if not os.path.exists(chemin):
-        print(f"  Export Exportify   : absent ({FICHIER_EXPORTIFY}) -> pas de phases automatiques")
+    """Lit tous les exports Exportify du dossier. Retourne dict uri -> features (ou {})."""
+    fichiers = []
+    for nom in sorted(os.listdir(BASE_DIR)):
+        if not nom.lower().endswith(".csv") or nom.startswith("hot_tracks_"):
+            continue
+        try:
+            with open(os.path.join(BASE_DIR, nom), encoding="utf-8-sig", newline="") as f:
+                entete_csv = next(csv.reader(f), [])
+        except Exception:
+            continue
+        if "Track URI" in entete_csv and "Energy" in entete_csv:
+            fichiers.append(nom)
+    if not fichiers:
+        print("  Export Exportify   : aucun -> pas de phases ni de playlist SOIREE")
         return {}
     feats = {}
-    with open(chemin, encoding="utf-8-sig", newline="") as f:
-        r = csv.DictReader(f)
-        for row in r:
-            uri = (row.get("Track URI") or "").strip()
-            if not uri:
-                continue
-            try:
-                feats[uri] = {
-                    "energie": float(row.get("Energy") or 0),
-                    "tempo": round(float(row.get("Tempo") or 0)),
-                    "danse": float(row.get("Danceability") or 0),
-                    "valence": float(row.get("Valence") or 0),
-                    "genres": (row.get("Genres") or "").strip(),
-                }
-            except ValueError:
-                continue
-    print(f"  Export Exportify   : {len(feats)} titres avec audio features")
+    for nom in fichiers:
+        avant = len(feats)
+        with open(os.path.join(BASE_DIR, nom), encoding="utf-8-sig", newline="") as f:
+            lire_lignes_exportify(csv.DictReader(f), feats)
+        print(f"  Export Exportify   : {nom} -> {len(feats) - avant} titres nouveaux")
+    print(f"  Audio features     : {len(feats)} titres au total")
     return feats
+
+
+def lire_lignes_exportify(r, feats):
+    """Ajoute a feats les lignes d'un export Exportify (le premier fichier lu prime en cas de doublon)."""
+    for row in r:
+        uri = (row.get("Track URI") or "").strip()
+        if not uri or uri in feats:
+            continue
+        try:
+            feats[uri] = {
+                "energie": float(row.get("Energy") or 0),
+                "tempo": round(float(row.get("Tempo") or 0)),
+                "danse": float(row.get("Danceability") or 0),
+                "valence": float(row.get("Valence") or 0),
+                "genres": (row.get("Genres") or "").strip(),
+            }
+        except ValueError:
+            continue
 
 
 def phase_de(feat):
@@ -207,6 +255,71 @@ def phase_de(feat):
     return "peak" if d >= SEUIL_DANSE_PEAK else "fin"
 
 
+def famille_de(feat):
+    """Retourne la cle de famille de style d'un titre, et 'genre' ou 'devine' selon la methode."""
+    if not feat:
+        return "", ""
+    tags = [g.strip().lower() for g in feat["genres"].split(",") if g.strip()]
+    if tags:
+        meilleur, meilleur_n = "", 0
+        familles = sorted(FAMILLES, key=lambda f: PRIORITE_EGALITE.index(f[0]) if f[0] in PRIORITE_EGALITE else 99)
+        for cle, _lib, mots, _bpm, _sens in familles:
+            n = sum(1 for t in tags if any(m in t for m in mots) and not m_exclu(cle, t))
+            if n > meilleur_n:
+                meilleur, meilleur_n = cle, n
+        if meilleur:
+            return meilleur, "genre"
+    ph = phase_de(feat)
+    return FAMILLE_SANS_GENRE.get(ph, ""), "devine"
+
+
+def m_exclu(cle, tag):
+    """Exclusions de mots-cles ambigus."""
+    if cle == "dub" and "dubstep" in tag:
+        return True
+    if cle == "chill" and tag in ("jazz rap", "jazz house", "jazz funk"):
+        return True
+    if cle == "groove" and ("house" in tag or "nu disco" in tag):
+        return True
+    if cle == "pop" and ("afropop" in tag or "pop urbaine" in tag):
+        return True
+    return False
+
+
+def bpm_corrige(tempo, bpm_min):
+    """Ramene le tempo dans la plage [bpm_min, 2 x bpm_min) par divisions / multiplications par 2."""
+    if not tempo or tempo <= 0:
+        return 0
+    t = float(tempo)
+    while t >= 2 * bpm_min:
+        t /= 2
+    while t < bpm_min:
+        t *= 2
+    return round(t)
+
+
+def construire_soiree(lignes, feats):
+    """Selectionne les meilleurs scores jusqu'a DUREE_SOIREE_H, puis ordonne par famille puis BPM corrige."""
+    infos_fam = {f[0]: f for f in FAMILLES}
+    candidats = [d for d in lignes if d["uri"] in feats]
+    retenus, duree = [], 0
+    for d in candidats:                                  # lignes deja triees par score decroissant
+        if duree >= DUREE_SOIREE_H * 3600 * 1000:
+            break
+        retenus.append(d)
+        duree += d.get("duree_ms") or 0
+    blocs = {f[0]: [] for f in FAMILLES}
+    for d in retenus:
+        fam = d.get("famille_cle")
+        if fam in blocs:
+            blocs[fam].append(d)
+    ordre = []
+    for cle, lib, _m, bpm_min, sens in FAMILLES:
+        bloc = sorted(blocs[cle], key=lambda x: x["bpm_corrige"], reverse=(sens == "desc"))
+        ordre.extend(bloc)
+    return ordre, blocs, duree
+
+
 def scorer(tops, likes):
     """Construit le tableau scoré. Retourne une liste de dicts triée par score décroissant."""
     table = {}
@@ -216,7 +329,8 @@ def scorer(tops, likes):
         if uri not in table:
             d = infos_track(t)
             d.update({"score": 0.0, "like": "", "rang_4sem": "", "rang_6mois": "", "rang_long": "",
-                      "phase": "", "energie": "", "tempo": "", "danse": "", "valence": "", "genres": ""})
+                      "phase": "", "energie": "", "tempo": "", "danse": "", "valence": "", "genres": "",
+                      "famille": "", "famille_methode": "", "bpm_corrige": "", "ordre_soiree": ""})
             table[uri] = d
         return table[uri]
 
@@ -252,6 +366,13 @@ def enrichir(lignes, feats):
         nb += 1
         d.update(f)
         d["phase"] = NOMS_SETS[phase_de(f)].split(" - ")[1] if phase_de(f) else ""
+        fam, methode = famille_de(f)
+        if fam:
+            info = next(x for x in FAMILLES if x[0] == fam)
+            d["famille_cle"] = fam
+            d["famille"] = info[1]
+            d["famille_methode"] = methode
+            d["bpm_corrige"] = bpm_corrige(f["tempo"], info[3])
     print(f"Titres scores avec features : {nb}/{len(lignes)}")
     return lignes
 
@@ -270,6 +391,7 @@ def ecrire_csv(lignes):
     horodatage = datetime.datetime.now().strftime("%Y%m%d_%H%M")
     chemin = os.path.join(BASE_DIR, f"hot_tracks_{horodatage}.csv")
     colonnes = ["rang", "score", "titre", "artistes", "album", "annee", "like", "phase",
+                "ordre_soiree", "famille", "famille_methode", "bpm_corrige",
                 "energie", "tempo", "danse", "valence", "genres",
                 "rang_4sem", "rang_6mois", "rang_long", "popularite", "duree", "uri"]
     with open(chemin, "w", newline="", encoding="utf-8-sig") as f:
@@ -340,6 +462,12 @@ def main():
         print(f"  {d['rang']:>3}. {d['score']:>5.2f}  {d['artistes']} - {d['titre']}{ph}")
     print()
 
+    soiree, blocs, duree_soiree = ([], {}, 0)
+    if CREER_SOIREE and feats:
+        soiree, blocs, duree_soiree = construire_soiree(lignes, feats)
+        for i, d in enumerate(soiree):
+            d["ordre_soiree"] = i + 1
+
     ecrire_csv(lignes)
     print()
 
@@ -366,7 +494,20 @@ def main():
                     sans += 1
             for k, nom in NOMS_SETS.items():
                 print(f"  {nom:<28}: {compte[k]:>3} candidats, {len(sets[k])} retenus")
-            print(f"  sans features (likes post-export ou non likes) : {sans}")
+            print(f"  sans features (absents des exports Exportify) : {sans}")
+    if soiree:
+        creer_playlist(sp, user_id, NOM_PLAYLIST_SOIREE,
+                       f"Meilleurs scores ({DUREE_SOIREE_H:g} h) enchaines par style puis BPM corrige - v{VERSION}. Mix : Auto, SANS Smart Reorder.",
+                       [d["uri"] for d in soiree], existantes)
+        print()
+        h, m = divmod(round(duree_soiree / 60000), 60)
+        devines = sum(1 for d in soiree if d["famille_methode"] == "devine")
+        print(f"Playlist SOIREE : {len(soiree)} titres, {h} h {m:02d} ({devines} titres sans genre, famille devinee)")
+        for cle, lib, _m, _b, sens in FAMILLES:
+            b = blocs.get(cle, [])
+            if b:
+                bpms = [x["bpm_corrige"] for x in b]
+                print(f"  {lib:<30}: {len(b):>3} titres, BPM {min(bpms)}-{max(bpms)} ({'croissant' if sens == 'asc' else 'decroissant'})")
     print()
     print("Termine.")
     return 0

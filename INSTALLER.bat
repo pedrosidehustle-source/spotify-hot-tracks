@@ -1,6 +1,6 @@
 @echo off
 chcp 65001 >nul
-echo === Installation spotify_hot_tracks v1.2 (2026-10-09) ===
+echo === Installation spotify_hot_tracks v1.3 (2026-10-09) ===
 echo.
 python --version
 if errorlevel 1 (
