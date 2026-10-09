@@ -1,0 +1,12 @@
+# Identifiants et jeton Spotify : ne jamais publier
+credentials.txt
+.cache_spotify
+.cache*
+
+# Donnees personnelles
+Liked_Songs*.csv
+hot_tracks_*.csv
+
+# Python
+__pycache__/
+*.pyc
